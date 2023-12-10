@@ -1,11 +1,12 @@
+import os
 import time
 
 import torch
+import torchvision.transforms as T
 from PIL import Image
 from torch import Tensor, nn
 from torch.utils.data import DataLoader
-from torchvision.datasets import MNIST
-from torchvision.transforms import Compose, ToTensor
+from torchvision.datasets import MNIST, Flowers102
 
 
 class VAE(nn.Module):
@@ -39,36 +40,74 @@ class VAE(nn.Module):
         # inference model q(z|x)
         mean_qz_given_x, log_std_qz_given_x = self.encoder(x).chunk(2, dim=-1)
         e = torch.randn(x.shape[0], self.z_dim, device=x.device, dtype=x.dtype)  # reparam trick
-        z = mean_qz_given_x + e * log_std_qz_given_x.exp()
-        log_qz_given_x = -0.5 * e.square().sum(-1) - log_std_qz_given_x.sum(-1)
+        std_qz_given_x = log_std_qz_given_x.exp()
+        z = mean_qz_given_x + e * std_qz_given_x
 
         # generative model p(x,z) = p(x|z) * p(z)
-        log_pz = -0.5 * z.square().sum(-1)  # prior
         mean_px_given_z = self.decoder(z)
         log_px_given_z = -0.5 * (x - mean_px_given_z).square().sum(-1)  # reconstruction loss
 
-        elbo = log_px_given_z + log_pz - log_qz_given_x
+        kl_div_q_given_x_px = 0.5 * (
+            mean_qz_given_x.square().sum(-1) + std_qz_given_x.square().sum(-1) - 2 * log_std_qz_given_x.sum(-1)
+        )
+        elbo = log_px_given_z - kl_div_q_given_x_px
         return -elbo.mean()
 
 
 def main():
-    ds = MNIST("mnist", download=True, transform=Compose([ToTensor(), nn.Flatten(0)]))
-    dloader = DataLoader(ds, batch_size=32, shuffle=True, num_workers=0, drop_last=True)
+    dataset = "flowers102"
 
-    vae = VAE(28 * 28, 16, 128)
+    if dataset == "mnist":
+        img_size = 28
+        n_channels = 1
+        z_dim = 16
+        hidden_dim = 128
+
+        transform = T.Compose([T.ToTensor(), nn.Flatten(0)])
+        ds = MNIST("data", download=True, transform=transform)
+
+    elif dataset == "flowers102":
+        img_size = 64
+        n_channels = 3
+        z_dim = 16
+        hidden_dim = 512
+
+        transform = T.Compose(
+            [
+                T.Resize(img_size, T.InterpolationMode.LANCZOS),
+                T.CenterCrop(img_size),
+                T.ToTensor(),
+                nn.Flatten(0),
+            ]
+        )
+        ds = Flowers102("data", download=True, transform=transform)
+
+    else:
+        raise ValueError(f"Unsupported dataset={dataset}")
+
+    dloader = DataLoader(ds, batch_size=128, shuffle=True, num_workers=0, drop_last=True)
+
+    vae = VAE(img_size * img_size * n_channels, z_dim, hidden_dim)
     optim = torch.optim.AdamW(vae.parameters(), 1e-3, betas=(0.9, 0.95), weight_decay=1e-3)
 
-    fixed_z = torch.randn(8 * 8, 16)
+    fixed_z = torch.randn(8 * 8, z_dim)
 
     @torch.no_grad()
     def generate(epoch_idx: int):
         generated = vae.decoder(fixed_z)
-        grid = generated.view(8, 8, 28, 28).permute(0, 2, 1, 3).reshape(8 * 28, 8 * 28)
+        grid = (
+            generated.view(8, 8, n_channels, img_size, img_size)
+            .permute(0, 3, 1, 4, 2)
+            .reshape(8 * img_size, 8 * img_size, n_channels)
+            .squeeze(-1)
+        )
         grid_u8 = (grid * 256).clip(0, 255.9999).to(torch.uint8)
-        Image.fromarray(grid_u8.numpy()).save(f"epoch_{epoch_idx:04d}.png")
+
+        os.makedirs(dataset, exist_ok=True)
+        Image.fromarray(grid_u8.numpy()).save(f"{dataset}/epoch_{epoch_idx:04d}.png")
 
     generate(0)
-    for epoch_idx in range(10):
+    for epoch_idx in range(100):
         time0 = time.perf_counter()
 
         for images, labels in dloader:
@@ -79,8 +118,10 @@ def main():
             optim.zero_grad(True)
 
         throughput = len(dloader) / (time.perf_counter() - time0)
-        print(f"Epoch {epoch_idx+1: 2d}: loss={loss.item():.4f} | throughput={throughput:.2f}it/s")
+        print(f"Epoch {epoch_idx+1}: loss={loss.item():.4f} | throughput={throughput:.2f}it/s")
         generate(epoch_idx + 1)
+
+    torch.save(vae.state_dict(), f"model_{dataset}.pth")
 
 
 if __name__ == "__main__":

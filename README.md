@@ -8,5 +8,5 @@ Let's learn VAE!
 Toy VAE with MNIST (3-layer MLP for encoder and decoder)
 
 ```bash
-python vae_mnist.py
+python vae.py
 ```
